@@ -32,6 +32,7 @@ persistentVolumeClaim:
 {{- else -}}
 hostPath:
   path: {{ .Values.shared_storage.hostpath.root_path }}
+  type: DirectoryOrCreate
 {{- end -}}
 {{- end -}}
 
@@ -48,6 +49,7 @@ persistentVolumeClaim:
 {{- else -}}
 hostPath:
   path: {{ .Values.infrastructure_storage.hostpath.root_path }}
+  type: DirectoryOrCreate
 {{- end -}}
 {{- else -}}
 {{ template "reana.shared_volume" . }}
