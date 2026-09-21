@@ -32,7 +32,6 @@ persistentVolumeClaim:
 {{- else -}}
 hostPath:
   path: {{ .Values.shared_storage.hostpath.root_path }}
-  type: DirectoryOrCreate
 {{- end -}}
 {{- end -}}
 

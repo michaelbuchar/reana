@@ -5,8 +5,20 @@ metadata:
   namespace: __ROOK_NAMESPACE__
 spec:
   dataDirHostPath: /var/lib/rook
+  # This single-node profile runs `osd_pool_default_size: 1`, so there is no
+  # redundancy and `ceph osd ok-to-stop` is always false ("PGs would become
+  # offline"). Without this, any CephCluster spec change leaves the operator
+  # retrying "OSD N is not ok-to-stop" until
+  # `waitTimeoutForHealthyOSDInMinutes` expires per OSD, which outlasts the
+  # readiness budget in scripts/deploy-kind-rook-cephfs.sh.
+  continueUpgradeAfterChecksEvenIfNotHealthy: true
   cephVersion:
-    image: quay.io/ceph/ceph:v20
+    # Pinned, not floating. The `v20` tag now resolves to 20.2.4, whose mon
+    # rejects cephx from the 20.2.1 client shipped inside the pinned Rook
+    # v1.19.6 operator image ("handle_auth_bad_method ... errno 13"), so the
+    # operator can never confirm mon quorum and the cluster never leaves
+    # "Configuring Ceph Mons". Bump this together with ROOK_VERSION.
+    image: quay.io/ceph/ceph:v20.2.1
     allowUnsupported: true
   mon:
     count: 1

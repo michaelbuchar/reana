@@ -100,6 +100,27 @@ def load_cluster_values(values_files):
     return values_dict
 
 
+def cluster_data_roots(shared_storage_backend):
+    """Return the node-side data roots owned by the effective deployment.
+
+    The shared workspace root is always owned. The CephFS overlay moves the
+    database and message broker onto a separate infrastructure hostPath, so
+    that root is read back from the overlay instead of being hard-coded here.
+    """
+    data_roots = ["/var/reana"]
+    if shared_storage_backend != "cephfs":
+        return data_roots
+
+    infrastructure_storage = load_cluster_values((CEPHFS_VALUES_FILE,)).get(
+        "infrastructure_storage", {}
+    )
+    if infrastructure_storage.get("backend") == "hostpath":
+        root_path = infrastructure_storage.get("hostpath", {}).get("root_path")
+        if root_path and root_path not in data_roots:
+            data_roots.append(root_path)
+    return data_roots
+
+
 def validate_shared_storage_backend(kubernetes, shared_storage_backend):
     """Reject unsupported local shared storage combinations."""
     if shared_storage_backend == "cephfs" and kubernetes != "kind":
@@ -145,19 +166,43 @@ def load_cephfs_state():
     return state
 
 
-def selected_shared_storage_backend(requested_backend):
-    """Prefer persisted lifecycle state when deleting a local cluster."""
+def selected_shared_storage_backend(requested_backend, kubernetes=None):
+    """Prefer persisted lifecycle state when deleting a local cluster.
+
+    An explicitly requested backend always wins, so that a stale record can
+    never steer a command the caller has already made unambiguous. The record
+    is also only consulted for the Kubernetes provider that wrote it.
+    """
     state = load_cephfs_state()
     persisted_backend = state.get("backend")
-    if persisted_backend in SHARED_STORAGE_BACKENDS:
-        if requested_backend and requested_backend != persisted_backend:
+    persisted_kubernetes = state.get("kubernetes")
+
+    if requested_backend:
+        if (
+            persisted_backend in SHARED_STORAGE_BACKENDS
+            and persisted_backend != requested_backend
+            and persisted_kubernetes == kubernetes
+        ):
             display_message(
-                "[WARNING] Ignoring the requested shared storage backend "
-                f"'{requested_backend}'; lifecycle state records '{persisted_backend}'.",
+                f"[WARNING] Lifecycle state records the '{persisted_backend}' shared "
+                f"storage backend, but '{requested_backend}' was requested explicitly; "
+                "using the requested backend.",
                 "reana",
             )
+        return requested_backend, state
+
+    if persisted_backend in SHARED_STORAGE_BACKENDS:
+        if kubernetes is not None and persisted_kubernetes != kubernetes:
+            display_message(
+                f"[WARNING] Ignoring lifecycle state recorded for --kubernetes "
+                f"'{persisted_kubernetes}'; '{kubernetes}' was selected. Pass "
+                "--shared-storage-backend explicitly to act on that state.",
+                "reana",
+            )
+            return "hostpath", state
         return persisted_backend, state
-    return requested_backend or "hostpath", state
+
+    return "hostpath", state
 
 
 def kind_cephfs_node_name():
@@ -677,8 +722,20 @@ def cluster_deploy(
     default="kind",
     help="What Kubernetes cluster to use? (kind, colima/k3s). [default=kind]",
 )
-def cluster_undeploy(namespace, instance_name, kubernetes):  # noqa: D301
+@click.option(
+    "--shared-storage-backend",
+    type=click.Choice(SHARED_STORAGE_BACKENDS),
+    default=None,
+    help="Deployed shared workspace backend. [default: detect from lifecycle state]",
+)
+def cluster_undeploy(
+    namespace, instance_name, kubernetes, shared_storage_backend
+):  # noqa: D301
     """Undeploy REANA cluster."""
+    shared_storage_backend, _ = selected_shared_storage_backend(
+        shared_storage_backend, kubernetes
+    )
+    data_roots = cluster_data_roots(shared_storage_backend)
     helm_releases = run_command(
         f"helm ls --short -n {namespace}", "reana", return_output=True
     ).splitlines()
@@ -689,15 +746,22 @@ def cluster_undeploy(namespace, instance_name, kubernetes):  # noqa: D301
         ]:
             run_command(cmd, "reana")
         if kubernetes == "colima/k3s":
-            for cmd in [
-                "colima exec -- sh -c 'sudo /bin/rm -rf /var/reana/*'",
-            ]:
-                run_command(cmd, "reana")
+            for data_root in data_roots:
+                run_command(
+                    f"colima exec -- sh -c 'sudo /bin/rm -rf {data_root}/*'", "reana"
+                )
         elif kubernetes == "kind":
-            for cmd in [
-                "docker exec -i -t kind-control-plane sh -c '/bin/rm -rf /var/reana/*'",
-            ]:
-                run_command(cmd, "reana")
+            # No `-i -t` here: allocating a TTY makes this fail with "cannot
+            # attach stdin to a TTY-enabled container" whenever undeploy runs
+            # non-interactively (CI, a pipeline, a background shell), which
+            # would abort the command before the remaining data roots are
+            # cleaned.
+            for data_root in data_roots:
+                run_command(
+                    "docker exec kind-control-plane sh -c "
+                    f"'/bin/rm -rf {data_root}/*'",
+                    "reana",
+                )
         else:
             display_message(
                 f"[ERROR] Unsupported --kubernetes option value '{kubernetes}'. Must be 'kind' [default] or 'colima/k3s'. Exiting.",
@@ -835,7 +899,9 @@ def cluster_delete(
        $ reana-dev cluster-delete -m /var/reana:/var/reana
     """
     cmds = []
-    shared_storage_backend, _ = selected_shared_storage_backend(shared_storage_backend)
+    shared_storage_backend, _ = selected_shared_storage_backend(
+        shared_storage_backend, kubernetes
+    )
     validate_shared_storage_backend(kubernetes, shared_storage_backend)
     if kubernetes == "kind" and shared_storage_backend == "cephfs":
         state_file = cephfs_state_file()

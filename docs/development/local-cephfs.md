@@ -56,6 +56,21 @@ The fsGroup probe inspects the live batch and user-job pods before checking
 cross-run persistence. The Jupyter probe opens a real interactive session and
 checks the actual workflow workspace and REANA user-secret mounts.
 
+## Undeploy
+
+Removing only the REANA release, while keeping the Rook substrate, also resets
+the data roots owned by the deployment:
+
+```console
+$ reana-dev cluster-undeploy
+```
+
+The CephFS profile keeps PostgreSQL and RabbitMQ on their own
+`/var/reana-infrastructure` hostPath, so undeploy clears both that root and the
+shared `/var/reana` root. Without this, a redeploy would reuse the previous
+database and report a broken admin-user setup as successful. The backend is
+detected from lifecycle state; pass `--shared-storage-backend` to override it.
+
 ## Delete
 
 Delete the cluster without repeating the backend option:

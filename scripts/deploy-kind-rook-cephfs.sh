@@ -177,7 +177,7 @@ write_state() {
         printf 'node_container\t%s\n' "${NODE_CONTAINER}"
         printf 'node_image\t%s\n' "${node_image}"
         printf 'base_dir\t%s\n' "${BASE_DIR}"
-        docker exec "${NODE_CONTAINER}" awk '{printf "device\\t%s\\t%s\\n", $1, $2}' "${MAP_FILE}"
+        docker exec "${NODE_CONTAINER}" awk '{printf "device\t%s\t%s\n", $1, $2}' "${MAP_FILE}"
     } >"${state_tmp}"
     chmod 600 "${state_tmp}"
     mv "${state_tmp}" "${STATE_FILE}"
@@ -226,16 +226,27 @@ if [ "${CHECK_ONLY}" = "false" ]; then
     kubectl -n "${ROOK_NAMESPACE}" rollout status deployment/rook-ceph-operator --timeout=10m
     kubectl apply -f "${CLUSTER_MANIFEST}"
 else
-    # Reconcile any loop paths repaired after a Docker VM restart.
-    kubectl apply -f "${CLUSTER_MANIFEST}"
+    # Reconcile loop paths repaired after a Docker VM restart, but only when the
+    # rendered manifest actually differs from the live object. An unconditional
+    # apply bumps `.metadata.generation` on every preflight and makes Rook roll
+    # the OSD deployments, which is slow and needlessly disruptive.
+    if kubectl diff -f "${CLUSTER_MANIFEST}" >/dev/null 2>&1; then
+        echo "CephCluster already matches the rendered device map; not re-applying."
+    else
+        echo "Rendered device map differs from the live CephCluster; re-applying."
+        kubectl apply -f "${CLUSTER_MANIFEST}"
+    fi
 fi
 
+# Readiness is reported by `.status.phase`. The `.status.state` field carries
+# Rook's ClusterState enum (Creating/Created/Updating/Error) and never becomes
+# "Ready", so waiting on it would always exhaust the timeout.
 wait_for_jsonpath_value \
     "${ROOK_NAMESPACE}" \
     "cephcluster/rook-ceph" \
-    "{.status.state}" \
+    "{.status.phase}" \
     "Ready" \
-    "CephCluster state" \
+    "CephCluster phase" \
     600 \
     5 || fail "CephCluster rook-ceph did not reach Ready within the timeout."
 

@@ -204,6 +204,120 @@ def test_cephfs_lifecycle_state_round_trip(tmp_path, monkeypatch):
     assert selected_shared_storage_backend(None) == ("cephfs", state)
 
 
+def test_selected_shared_storage_backend_ignores_state_of_another_provider(
+    tmp_path, monkeypatch
+):
+    """A Kind record must not steer an unrelated Colima/K3s command."""
+    from reana.reana_dev.cluster import (
+        cephfs_state_file,
+        selected_shared_storage_backend,
+    )
+
+    monkeypatch.setenv("REANA_DEV_STATE_DIR", str(tmp_path))
+    Path(cephfs_state_file()).write_text("backend\tcephfs\nkubernetes\tkind\n")
+
+    assert selected_shared_storage_backend(None, "kind")[0] == "cephfs"
+    assert selected_shared_storage_backend(None, "colima/k3s")[0] == "hostpath"
+
+
+def test_selected_shared_storage_backend_prefers_the_explicit_selector(
+    tmp_path, monkeypatch
+):
+    """An explicit selector must provide a recovery path from stale state."""
+    from reana.reana_dev.cluster import (
+        cephfs_state_file,
+        selected_shared_storage_backend,
+    )
+
+    monkeypatch.setenv("REANA_DEV_STATE_DIR", str(tmp_path))
+    Path(cephfs_state_file()).write_text("backend\tcephfs\nkubernetes\tkind\n")
+
+    assert selected_shared_storage_backend("hostpath", "kind")[0] == "hostpath"
+    assert selected_shared_storage_backend("cephfs", "kind")[0] == "cephfs"
+
+
+@patch("reana.reana_dev.cluster.get_srcdir")
+def test_cluster_data_roots_include_the_cephfs_infrastructure_path(get_srcdir_mock):
+    """CephFS deployments own a second, separate infrastructure data root."""
+    from reana.reana_dev.cluster import cluster_data_roots
+
+    get_srcdir_mock.return_value = str(Path(__file__).parent.parent)
+
+    assert cluster_data_roots("hostpath") == ["/var/reana"]
+    assert cluster_data_roots("cephfs") == [
+        "/var/reana",
+        "/var/reana-infrastructure",
+    ]
+
+
+@patch("reana.reana_dev.cluster.get_srcdir")
+@patch("reana.reana_dev.cluster.run_command")
+def test_cluster_undeploy_clears_the_cephfs_infrastructure_root(
+    run_command_mock, get_srcdir_mock, tmp_path, monkeypatch
+):
+    """Undeploy must reset the database and broker stores it moved aside."""
+    from reana.reana_dev.cluster import cephfs_state_file, cluster_undeploy
+
+    monkeypatch.setenv("REANA_DEV_STATE_DIR", str(tmp_path))
+    Path(cephfs_state_file()).write_text("backend\tcephfs\nkubernetes\tkind\n")
+    get_srcdir_mock.return_value = str(Path(__file__).parent.parent)
+    run_command_mock.return_value = "reana\n"
+
+    result = CliRunner().invoke(cluster_undeploy, [])
+
+    assert result.exit_code == 0
+    removed_roots = [
+        args[0]
+        for (args, _) in (c for c in run_command_mock.call_args_list)
+        if "rm -rf" in str(args[0])
+    ]
+    assert any("/var/reana/*" in cmd for cmd in removed_roots)
+    assert any("/var/reana-infrastructure/*" in cmd for cmd in removed_roots)
+    # `docker exec -t` fails with "cannot attach stdin to a TTY-enabled
+    # container" when undeploy runs without a terminal, which would abort the
+    # command before the later data roots are cleaned.
+    assert not any(" -t " in cmd for cmd in removed_roots)
+
+
+def test_cephfs_device_rows_survive_the_producer_round_trip(tmp_path, monkeypatch):
+    """The recorded device rows must be readable by the state consumer."""
+    from reana.reana_dev.cluster import cephfs_state_file, load_cephfs_state
+
+    device_map = tmp_path / "device-map.txt"
+    device_map.write_text(
+        "/dev/loop3 /var/lib/rook-dev/osd-0.img\n"
+        "/dev/loop4 /var/lib/rook-dev/osd-1.img\n"
+    )
+
+    # Run the very awk program used by the lifecycle state writers, so that a
+    # producer/consumer format mismatch cannot pass unnoticed again.
+    awk_program = next(
+        line.split("awk ", 1)[1].split("' ", 1)[0] + "'"
+        for line in Path("scripts/setup-kind-rook-loop-devices.sh")
+        .read_text()
+        .splitlines()
+        if 'printf "device' in line
+    ).strip("'")
+    device_rows = subprocess.run(
+        ["awk", awk_program, str(device_map)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+    monkeypatch.setenv("REANA_DEV_STATE_DIR", str(tmp_path))
+    Path(cephfs_state_file()).write_text(
+        "backend\tcephfs\n"
+        "kubernetes\tkind\n"
+        "node_container\tkind-control-plane\n" + device_rows
+    )
+
+    assert load_cephfs_state()["devices"] == [
+        {"path": "/dev/loop3", "backing_file": "/var/lib/rook-dev/osd-0.img"},
+        {"path": "/dev/loop4", "backing_file": "/var/lib/rook-dev/osd-1.img"},
+    ]
+
+
 @pytest.mark.parametrize(
     "options, initial_values, expected_values_files, expected_final_values, run_command_side_effects, exit_code",
     [
@@ -668,7 +782,7 @@ def test_cluster_delete_cephfs_invokes_kind_helpers(
     )
 
     assert result.exit_code == 0
-    selected_backend_mock.assert_called_once_with(None)
+    selected_backend_mock.assert_called_once_with(None, "kind")
     assert run_command_mock.call_args_list == [
         call(
             [
